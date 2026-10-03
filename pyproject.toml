@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wheeltruth"
+version = "0.1.0"
+description = "Check that your built wheel/sdist actually contains everything the package needs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "hao li"}]
+keywords = ["pypi", "wheel", "packaging", "ci", "sdist"]
+
+[project.scripts]
+wheeltruth = "wheeltruth.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/hahahahahahahahah6/wheeltruth"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["wheeltruth*"]
