@@ -168,6 +168,30 @@ def test_record_lists_missing_file(tmp_path):
     assert ("error", "record-dangling") in codes(rep)
 
 
+def test_vendored_dist_info_record_is_not_merged(tmp_path):
+    files = dist_info_files()
+    files.update({
+        "demo/__init__.py": b"",
+        "demo/_vendor/dependency-2.0.dist-info/METADATA":
+            b"Name: dependency\nVersion: 2.0\n",
+        "demo/_vendor/dependency-2.0.dist-info/RECORD":
+            b"dependency/__init__.py,,\n",
+    })
+    files["demo-0.1.0.dist-info/RECORD"] = record_text(
+        files, "demo-0.1.0.dist-info"
+    )
+    whl = tmp_path / "demo-0.1.0-py3-none-any.whl"
+    with zipfile.ZipFile(whl, "w") as zf:
+        for arc, content in files.items():
+            zf.writestr(arc, content)
+
+    wheel = C.read_wheel(str(whl))
+    (rep,) = C.check_artifacts([str(whl)])
+    assert wheel.dist_info == "demo-0.1.0.dist-info"
+    assert "dependency/__init__.py" not in wheel.record
+    assert not [f for f in rep.findings if f.code == "record-dangling"]
+
+
 def test_wheel_without_record(tmp_path):
     whl = write_wheel(tmp_path / "demo-0.1.0-py3-none-any.whl",
                       {"demo/__init__.py": b"x=1\n"}, include_record=False)
@@ -205,8 +229,28 @@ def test_entry_point_with_extras_marker(tmp_path):
     assert not [f for f in rep.findings if f.code == "entry-point-dangling"]
 
 
-def test_stub_missing_warning_mlx_style(tmp_path):
-    # py.typed + some stubs present, but one module lost its .pyi (the MLX case)
+def test_entry_point_can_target_shipped_data_file(tmp_path):
+    ep = "[pkg_config]\nnumpy = numpy/_core/lib/pkgconfig/numpy.pc\n"
+    whl = write_wheel(tmp_path / "demo-0.1.0-py3-none-any.whl", {
+        "numpy/__init__.py": b"",
+        "numpy/_core/lib/pkgconfig/numpy.pc": b"Name: NumPy\n",
+    }, entry_points=ep)
+    (rep,) = C.check_artifacts([whl])
+    assert not [f for f in rep.findings if f.code == "entry-point-dangling"]
+
+
+def test_entry_point_can_target_reexported_package_attribute(tmp_path):
+    ep = "[fsspec.specs]\nhf = huggingface_hub.HfFileSystem\n"
+    whl = write_wheel(tmp_path / "demo-0.1.0-py3-none-any.whl", {
+        "huggingface_hub/__init__.py":
+            b"from .hf_file_system import HfFileSystem\n",
+        "huggingface_hub/hf_file_system.py": b"class HfFileSystem: pass\n",
+    }, entry_points=ep)
+    (rep,) = C.check_artifacts([whl])
+    assert not [f for f in rep.findings if f.code == "entry-point-dangling"]
+
+
+def test_inline_typed_python_does_not_require_sibling_stubs(tmp_path):
     whl = write_wheel(tmp_path / "demo-0.1.0-py3-none-any.whl", {
         "demo/__init__.py": b"",
         "demo/py.typed": b"",
@@ -216,7 +260,18 @@ def test_stub_missing_warning_mlx_style(tmp_path):
     })
     (rep,) = C.check_artifacts([whl])
     missing = [f for f in rep.findings if f.code == "typing-stub-missing"]
-    assert len(missing) == 1 and "b.py" in missing[0].message
+    assert not missing
+
+
+def test_compiled_extension_without_source_or_stub_warns(tmp_path):
+    whl = write_wheel(tmp_path / "demo-0.1.0-py3-none-any.whl", {
+        "demo/__init__.py": b"",
+        "demo/py.typed": b"",
+        "demo/native.cpython-312-x86_64-linux-gnu.so": b"binary",
+    })
+    (rep,) = C.check_artifacts([whl])
+    missing = [f for f in rep.findings if f.code == "typing-stub-missing"]
+    assert len(missing) == 1 and "demo/native" in missing[0].message
     assert missing[0].severity == "warning"
 
 

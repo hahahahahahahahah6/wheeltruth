@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import base64
 import csv
 import hashlib
@@ -148,7 +149,24 @@ def read_wheel(path):
     with zipfile.ZipFile(path) as zf:
         wheel.files = [n for n in zf.namelist() if not n.endswith("/")]
         dist_infos = {n.split("/")[0] for n in wheel.files if _is_dist_info(n)}
-        wheel.dist_info = sorted(dist_infos)[0] if dist_infos else ""
+        # A wheel may contain vendored distributions, including their dist-info
+        # directories.  Select this wheel's metadata directory rather than the
+        # first one alphabetically; in particular, never merge vendored RECORDs.
+        for dist_info in sorted(dist_infos):
+            metadata_path = f"{dist_info}/METADATA"
+            if metadata_path not in wheel.files:
+                continue
+            headers = parse_rfc822_headers(
+                zf.read(metadata_path).decode("utf-8", "replace")
+            )
+            metadata_name, _ = _meta_name_version(headers)
+            if _norm_name(metadata_name) == _norm_name(wheel.filename_name):
+                wheel.dist_info = dist_info
+                break
+        # Preserve useful mismatch diagnostics for malformed wheels that have
+        # exactly one plausible metadata directory.
+        if not wheel.dist_info and len(dist_infos) == 1:
+            wheel.dist_info = next(iter(dist_infos))
         for name in wheel.files:
             if name == f"{wheel.dist_info}/METADATA" and wheel.dist_info:
                 wheel.metadata = parse_rfc822_headers(
@@ -158,7 +176,7 @@ def read_wheel(path):
                 wheel.entry_points = parse_entry_points(
                     zf.read(name).decode("utf-8", "replace")
                 )
-            elif name.endswith(".dist-info/RECORD") and "/RECORD" in name:
+            elif name == f"{wheel.dist_info}/RECORD" and wheel.dist_info:
                 text = zf.read(name).decode("utf-8", "replace")
                 for row in csv.reader(io.StringIO(text)):
                     if len(row) >= 1 and row[0]:
@@ -292,10 +310,8 @@ def check_record(wheel, rep):
                     )
 
 
-def _entry_point_target_path(value, files):
-    """Resolve 'module:attr [extras]' to a path inside the wheel, or None."""
-    target = value.split()[0]  # strip "[extra]" markers
-    module = target.split(":")[0].strip()
+def _module_path(module, files):
+    """Return the source path for *module*, if it is present in the wheel."""
     if not module or not re.match(r"^[A-Za-z_][\w.]*$", module):
         return None
     rel = module.replace(".", "/")
@@ -305,20 +321,66 @@ def _entry_point_target_path(value, files):
     return None
 
 
+def _init_exports(path, attribute, zf):
+    """Check an __init__.py for a locally defined or imported attribute."""
+    if not path.endswith("/__init__.py"):
+        return False
+    try:
+        tree = ast.parse(zf.read(path).decode("utf-8", "replace"))
+    except (KeyError, SyntaxError, ValueError):
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name == attribute:
+                return True
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if (alias.asname or alias.name.rsplit(".", 1)[-1]) == attribute:
+                    return True
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(isinstance(target, ast.Name) and target.id == attribute
+                   for target in targets):
+                return True
+    return False
+
+
+def _entry_point_target_path(value, files, zf):
+    """Resolve 'module:attr [extras]' to a path inside the wheel, or None."""
+    target = value.split()[0]  # strip "[extra]" markers
+    # Custom entry-point groups sometimes identify a shipped data file rather
+    # than an importable Python object (NumPy's pkg-config entry is one).
+    if target in files:
+        return target
+    module, separator, attribute = target.partition(":")
+    path = _module_path(module.strip(), files)
+    if path:
+        return path
+    # Some consumers use ``package.ExportedName`` rather than a colon.  Accept
+    # it only when the package initializer actually exposes that name.
+    if not separator and "." in module:
+        package, attribute = module.rsplit(".", 1)
+        path = _module_path(package, files)
+        if path and _init_exports(path, attribute, zf):
+            return path
+    return None
+
+
 def check_entry_points(wheel, rep):
     files = set(wheel.files)
-    for group in sorted(wheel.entry_points):
-        for name, value in wheel.entry_points[group]:
-            if _entry_point_target_path(value, files) is None:
-                rep.add(
-                    "error",
-                    "entry-point-dangling",
-                    f"[{group}] {name} = {value}: target module not found in wheel",
-                )
+    with zipfile.ZipFile(wheel.path) as zf:
+        for group in sorted(wheel.entry_points):
+            for name, value in wheel.entry_points[group]:
+                if _entry_point_target_path(value, files, zf) is None:
+                    rep.add(
+                        "error",
+                        "entry-point-dangling",
+                        f"[{group}] {name} = {value}: target not found in wheel",
+                    )
 
 
 def _top_package_dirs(files):
-    """Map top-level package dir -> {'py': set, 'pyi': set, 'py_typed': bool}."""
+    """Collect Python sources, stubs, and extension modules by package."""
     pkgs = {}
     for f in files:
         if _is_dist_info(f) or "/" not in f:
@@ -326,7 +388,9 @@ def _top_package_dirs(files):
         top = f.split("/")[0]
         if top in _NON_PACKAGE_TOPS or top.endswith(".data"):
             continue
-        entry = pkgs.setdefault(top, {"py": set(), "pyi": set(), "py_typed": False})
+        entry = pkgs.setdefault(
+            top, {"py": set(), "pyi": set(), "extensions": set(), "py_typed": False}
+        )
         base = f.rsplit("/", 1)[-1]
         if f.endswith("/py.typed") or base == "py.typed":
             entry["py_typed"] = True
@@ -334,11 +398,16 @@ def _top_package_dirs(files):
             entry["py"].add(f[: -len(".py")])
         elif f.endswith(".pyi"):
             entry["pyi"].add(f[: -len(".pyi")])
+        elif f.endswith((".so", ".pyd", ".dylib")):
+            # Strip both the library suffix and an optional ABI/platform tag.
+            directory, _, filename = f.rpartition("/")
+            module = filename.split(".", 1)[0]
+            entry["extensions"].add(f"{directory}/{module}" if directory else module)
     return pkgs
 
 
 def check_typing(wheel, rep):
-    """Stub consistency: packages shipping some .pyi should ship them all."""
+    """Warn only when a typed compiled module has neither source nor a stub."""
     pkgs = _top_package_dirs(wheel.files)
     for pkg in sorted(pkgs):
         entry = pkgs[pkg]
@@ -348,22 +417,20 @@ def check_typing(wheel, rep):
                 "typing-py-typed",
                 f"package {pkg}/ ships py.typed (typed package marker)",
             )
-        if entry["pyi"]:
+        if entry["py_typed"] or entry["pyi"]:
             missing = sorted(
-                s for s in entry["py"] - entry["pyi"]
-                if s.split("/")[-1] != "__init__"
-                # __init__.py rarely carries annotations worth stubbing;
-                # flagging it would drown the signal in noise.
+                s for s in entry["extensions"]
+                if s not in entry["py"] and s not in entry["pyi"]
             )
             for stem in missing:
                 rep.add(
                     "warning",
                     "typing-stub-missing",
-                    f"{pkg}/ ships .pyi stubs but {stem}.py has no sibling .pyi "
-                    f"(downstream type checkers may fail)",
-                    detail=f"{stem}.py",
+                    f"compiled extension {stem} has neither inline source nor a .pyi stub "
+                    f"(downstream type checkers have no type information)",
+                    detail=stem,
                 )
-            for stem in sorted(entry["pyi"] - entry["py"]):
+            for stem in sorted(entry["pyi"] - entry["py"] - entry["extensions"]):
                 # A stub for a C extension (stem.so) or namespace edge is fine;
                 # only flag when neither .py nor a sibling module exists.
                 rep.add(
